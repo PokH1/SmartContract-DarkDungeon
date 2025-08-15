@@ -4,12 +4,26 @@
 
 use sails_rs::{
     prelude::*,
-    gstd::msg,
+    gstd::{msg, exec, ext},
     collections::HashMap,
+    scale_codec::{Encode, Decode},
 };
+use core::fmt::Debug;
 
 // ============================ vNFT CONTRACT STATE ============================
 static mut VNFT_STATE: Option<VnftState> = None;
+
+/// Metadata for a single NFT, supporting dynamic media.
+#[derive(Debug, Clone, Encode, Decode, TypeInfo)]
+#[codec(crate = sails_rs::scale_codec)]
+#[scale_info(crate = sails_rs::scale_info)]
+pub struct TokenMetadata {
+    pub name: String,
+    pub description: String,
+    pub current_media_index: u64,
+    pub media: Vec<String>,
+    pub reference: String,
+}
 
 /// Struct representing a single NFT.
 #[derive(Debug, Clone, Encode, Decode, TypeInfo)]
@@ -18,7 +32,7 @@ static mut VNFT_STATE: Option<VnftState> = None;
 pub struct NFT {
     pub id: u64,
     pub owner: ActorId,
-    pub metadata: String,
+    pub metadata: TokenMetadata,
 }
 
 /// State for the vNFT contract.
@@ -29,11 +43,12 @@ pub struct VnftState {
     pub owner_nfts: HashMap<ActorId, Vec<u64>>,
     pub next_id: u64,
     pub main_contract: Option<ActorId>,
+    pub gas_for_one_time_updating: u64,
 }
 
 impl VnftState {
     /// Initialize state: required to call from seed function.
-    pub fn init(admin: ActorId, main_contract: Option<ActorId>) {
+    pub fn init(admin: ActorId, main_contract: Option<ActorId>, gas_for_one_time_updating: u64) {
         unsafe {
             VNFT_STATE = Some(Self {
                 admin,
@@ -41,6 +56,7 @@ impl VnftState {
                 owner_nfts: HashMap::new(),
                 next_id: 1,
                 main_contract,
+                gas_for_one_time_updating,
             });
         }
     }
@@ -66,6 +82,7 @@ pub struct IoVnftState {
     pub admin: ActorId,
     pub nfts: Vec<NFT>,
     pub main_contract: Option<ActorId>,
+    pub gas_for_one_time_updating: u64,
 }
 
 impl From<VnftState> for IoVnftState {
@@ -74,6 +91,7 @@ impl From<VnftState> for IoVnftState {
             admin: state.admin,
             nfts: state.nfts.values().cloned().collect(),
             main_contract: state.main_contract,
+            gas_for_one_time_updating: state.gas_for_one_time_updating,
         }
     }
 }
@@ -88,6 +106,8 @@ pub enum VnftEvent {
     Burned { id: u64, owner: ActorId },
     Transferred { id: u64, from: ActorId, to: ActorId },
     MainContractSet(ActorId),
+    MetadataStartedUpdating { updates_count: u32, update_period_in_blocks: u32, token_id: u64 },
+    MetadataUpdated { token_id: u64, current_media_index: u64 },
 }
 
 #[derive(Debug, Encode, Decode, TypeInfo, Clone)]
@@ -100,6 +120,12 @@ pub enum VnftError {
     AlreadyExists,
     InvalidMainContract,
     Overflow,
+    TokenDoesNotExist,
+    DeniedAccess,
+    InvalidUpdateCount,
+    InvalidUpdatePeriod,
+    NotificationError,
+    OnlyProgramCanUpdate,
 }
 
 // ============================ vNFT SERVICE ===================================
@@ -108,11 +134,11 @@ pub struct Service;
 
 impl Service {
     /// Seed the contract: set admin and optionally main contract.
-    pub fn seed(admin: ActorId, main_contract: Option<ActorId>) {
+    pub fn seed(admin: ActorId, main_contract: Option<ActorId>, gas_for_one_time_updating: u64) {
         if admin == ActorId::zero() {
             panic!("Admin cannot be zero");
         }
-        VnftState::init(admin, main_contract);
+        VnftState::init(admin, main_contract, gas_for_one_time_updating);
     }
 }
 
@@ -124,7 +150,7 @@ impl Service {
     }
 
     /// Mint a new NFT. Only admin or main_contract can mint.
-    pub fn mint(&mut self, to: ActorId, metadata: String) -> VnftEvent {
+    pub fn mint(&mut self, to: ActorId, metadata: TokenMetadata) -> VnftEvent {
         let caller = msg::source();
         let mut state = VnftState::state_mut();
         let may_main = state.main_contract;
@@ -189,6 +215,70 @@ impl Service {
         VnftEvent::MainContractSet(main_contract)
     }
 
+    // ============================ DYNAMIC METADATA EXTENSION ============================
+    /// Start scheduled metadata update for a token.
+    pub fn start_metadata_update(
+        &mut self,
+        updates_count: u32,
+        update_period_in_blocks: u32,
+        token_id: u64,
+    ) -> VnftEvent {
+        let msg_src = msg::source();
+        if updates_count == 0 {
+            panic!("Updates count cannot be zero");
+        }
+        if update_period_in_blocks == 0 {
+            panic!("Updates period cannot be zero");
+        }
+        panicking(|| {
+            start_metadata_updates(
+                VnftState::state_ref().gas_for_one_time_updating,
+                &mut VnftState::state_mut().nfts,
+                &mut VnftState::state_mut().owner_nfts,
+                token_id,
+                msg_src,
+                updates_count,
+                update_period_in_blocks,
+            )
+        });
+        self.emit_event(VnftEvent::MetadataStartedUpdating {
+            updates_count,
+            update_period_in_blocks,
+            token_id,
+        }).expect("Notification Error");
+        VnftEvent::MetadataStartedUpdating {
+            updates_count,
+            update_period_in_blocks,
+            token_id,
+        }
+    }
+
+    /// Handle actual metadata update for a token (called by delayed message).
+    pub fn update_metadata(
+        &mut self,
+        token_id: u64,
+        owner: ActorId,
+        update_period: u32,
+        updates_count: u32,
+    ) -> VnftEvent {
+        if msg::source() != exec::program_id() {
+            panic!("This message can only be sent by the programme");
+        }
+        let current_media_index = panicking(|| {
+            updates_metadata(
+                &mut VnftState::state_mut().nfts,
+                &mut VnftState::state_mut().owner_nfts,
+                token_id,
+                owner,
+                update_period,
+                updates_count,
+            )
+        });
+        self.emit_event(VnftEvent::MetadataUpdated { token_id, current_media_index })
+            .expect("Notification Error");
+        VnftEvent::MetadataUpdated { token_id, current_media_index }
+    }
+
     // ============================ QUERIES (3+) ===================================
     /// Query NFT info by id.
     pub fn query_nft(&self, id: u64) -> Option<NFT> {
@@ -225,11 +315,99 @@ impl Service {
     }
 
     /// Returns the list of all NFTs available with their token_id and token_metadata.
-    pub fn available_nfts(&self) -> Vec<(u64, String)> {
+    pub fn available_nfts(&self) -> Vec<(u64, TokenMetadata)> {
         VnftState::state_ref()
             .nfts
             .values()
             .map(|nft| (nft.id, nft.metadata.clone()))
             .collect()
     }
+}
+
+// ============================ DYNAMIC METADATA LOGIC ============================
+
+pub fn start_metadata_updates(
+    gas_for_one_time_updating: u64,
+    nfts: &mut HashMap<u64, NFT>,
+    owner_nfts: &mut HashMap<ActorId, Vec<u64>>,
+    token_id: u64,
+    msg_src: ActorId,
+    updates_count: u32,
+    update_period: u32,
+) -> Result<(), VnftError> {
+    let nft = nfts.get_mut(&token_id).ok_or(VnftError::TokenDoesNotExist)?;
+    if nft.owner != msg_src {
+        return Err(VnftError::DeniedAccess);
+    }
+    let metadata = &mut nft.metadata;
+    let media_len = metadata.media.len() as u64;
+    if media_len == 0 {
+        return Err(VnftError::TokenDoesNotExist);
+    }
+    metadata.current_media_index = metadata.current_media_index.saturating_add(1) % media_len;
+    if updates_count.saturating_sub(1) != 0 {
+        let request = [
+            b"DynamicNft".encode(),
+            b"UpdateMetadata".encode(),
+            (token_id, msg_src, update_period, updates_count - 1).encode(),
+        ]
+        .concat();
+        msg::send_bytes_with_gas_delayed(
+            exec::program_id(),
+            request,
+            gas_for_one_time_updating.saturating_mul(updates_count.into()),
+            0,
+            update_period,
+        )
+        .expect("Error in sending message");
+    }
+    Ok(())
+}
+
+pub fn updates_metadata(
+    nfts: &mut HashMap<u64, NFT>,
+    owner_nfts: &mut HashMap<ActorId, Vec<u64>>,
+    token_id: u64,
+    owner: ActorId,
+    update_period: u32,
+    updates_count: u32,
+) -> Result<u64, VnftError> {
+    let nft = nfts.get_mut(&token_id).ok_or(VnftError::TokenDoesNotExist)?;
+    if nft.owner != owner {
+        return Err(VnftError::DeniedAccess);
+    }
+    let metadata = &mut nft.metadata;
+    let media_len = metadata.media.len() as u64;
+    if media_len == 0 {
+        return Err(VnftError::TokenDoesNotExist);
+    }
+    metadata.current_media_index = metadata.current_media_index.saturating_add(1) % media_len;
+    if updates_count.saturating_sub(1) != 0 {
+        let request = [
+            b"DynamicNft".encode(),
+            b"UpdateMetadata".encode(),
+            (token_id, owner, update_period, updates_count - 1).encode(),
+        ]
+        .concat();
+        msg::send_bytes_with_gas_delayed(
+            exec::program_id(),
+            request,
+            exec::gas_available().saturating_sub(1_000_000_000),
+            0,
+            update_period,
+        )
+        .expect("Error in sending message");
+    }
+    Ok(metadata.current_media_index)
+}
+
+pub fn panicking<T, E: Debug, F: FnOnce() -> Result<T, E>>(f: F) -> T {
+    match f() {
+        Ok(v) => v,
+        Err(e) => panic!("{:?}", e),
+    }
+}
+
+pub fn panic(err: impl Debug) -> ! {
+    ext::panic(format!("{err:?}"))
 }
