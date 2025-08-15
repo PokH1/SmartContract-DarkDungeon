@@ -31,12 +31,23 @@ pub struct RunStats {
     pub survival_time: u64,
 }
 
+/// Keyring entry for a user
+#[derive(Debug, Encode, Decode, TypeInfo, Clone)]
+#[codec(crate = sails_rs::scale_codec)]
+#[scale_info(crate = sails_rs::scale_info)]
+pub struct KeyringEntry {
+    pub user: ActorId,
+    pub public_key: Vec<u8>,
+    pub metadata: Option<String>,
+}
+
 /// State for MainContract
 #[derive(Debug, Clone, Default)]
 pub struct MainContractState {
     pub admins: Vec<ActorId>,
     pub user_nft_selections: HashMap<ActorId, Vec<(ActorId, U256)>>,
     pub last_run_stats: HashMap<ActorId, RunStats>,
+    pub keyring: HashMap<ActorId, KeyringEntry>,
 }
 
 impl MainContractState {
@@ -86,6 +97,19 @@ pub enum MainEvent {
         user: ActorId,
         token_id: U256,
     },
+    KeyAdded {
+        user: ActorId,
+        public_key: Vec<u8>,
+        metadata: Option<String>,
+    },
+    KeyRemoved {
+        user: ActorId,
+    },
+    KeyUpdated {
+        user: ActorId,
+        public_key: Vec<u8>,
+        metadata: Option<String>,
+    },
 }
 
 /// Queryable IoState
@@ -96,6 +120,7 @@ pub struct IoMainContractState {
     pub admins: Vec<ActorId>,
     pub user_nft_selections: Vec<UserSelection>,
     pub last_run_stats: Vec<RunStats>,
+    pub keyring: Vec<KeyringEntry>,
 }
 
 impl From<MainContractState> for IoMainContractState {
@@ -111,10 +136,15 @@ impl From<MainContractState> for IoMainContractState {
             .values()
             .cloned()
             .collect();
+        let keyring = state.keyring
+            .values()
+            .cloned()
+            .collect();
         IoMainContractState {
             admins: state.admins,
             user_nft_selections,
             last_run_stats,
+            keyring,
         }
     }
 }
@@ -340,5 +370,100 @@ impl Service {
 
         // Return the new stats to the user
         new_status
+    }
+
+    /// Keyring: Add a public key for the user
+    pub fn add_key(&mut self, public_key: Vec<u8>, metadata: Option<String>) -> MainEvent {
+        let mut state = MainContractState::state_mut();
+        let user = msg::source();
+
+        if state.keyring.contains_key(&user) {
+            panic!("Key already exists for user");
+        }
+
+        let entry = KeyringEntry {
+            user,
+            public_key: public_key.clone(),
+            metadata: metadata.clone(),
+        };
+        state.keyring.insert(user, entry);
+
+        self.emit_event(MainEvent::KeyAdded {
+            user,
+            public_key,
+            metadata,
+        }).expect("Failed to emit event");
+
+        MainEvent::KeyAdded {
+            user,
+            public_key,
+            metadata,
+        }
+    }
+
+    /// Keyring: Remove the public key for the user
+    pub fn remove_key(&mut self) -> MainEvent {
+        let mut state = MainContractState::state_mut();
+        let user = msg::source();
+
+        if !state.keyring.contains_key(&user) {
+            panic!("No key exists for user");
+        }
+
+        state.keyring.remove(&user);
+
+        self.emit_event(MainEvent::KeyRemoved {
+            user,
+        }).expect("Failed to emit event");
+
+        MainEvent::KeyRemoved {
+            user,
+        }
+    }
+
+    /// Keyring: Update the public key for the user
+    pub fn update_key(&mut self, public_key: Vec<u8>, metadata: Option<String>) -> MainEvent {
+        let mut state = MainContractState::state_mut();
+        let user = msg::source();
+
+        if !state.keyring.contains_key(&user) {
+            panic!("No key exists for user");
+        }
+
+        let entry = KeyringEntry {
+            user,
+            public_key: public_key.clone(),
+            metadata: metadata.clone(),
+        };
+        state.keyring.insert(user, entry);
+
+        self.emit_event(MainEvent::KeyUpdated {
+            user,
+            public_key,
+            metadata,
+        }).expect("Failed to emit event");
+
+        MainEvent::KeyUpdated {
+            user,
+            public_key,
+            metadata,
+        }
+    }
+
+    /// Keyring: Query the public key for a user
+    pub fn query_key(&self, user: ActorId) -> Option<KeyringEntry> {
+        MainContractState::state_ref()
+            .keyring
+            .get(&user)
+            .cloned()
+    }
+
+    /// Keyring: Query all keyring entries
+    pub fn query_all_keys(&self) -> Vec<KeyringEntry> {
+        MainContractState::state_ref()
+            .keyring
+            .values()
+            .cloned()
+            .collect()
     }
 }

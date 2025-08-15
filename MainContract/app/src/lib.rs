@@ -2,6 +2,7 @@
 #![no_std]
 use sails_rs::prelude::*;
 pub mod services;
+
 use services::service::Service;
 
 pub struct Program;
