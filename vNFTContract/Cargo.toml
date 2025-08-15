@@ -1,18 +1,24 @@
-[workspace]
-resolver = "2"
+[package]
+name = "extended-vnft"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
 
-members = [
-    "app", "wasm",
-]
+[dependencies]
+extended-vnft-app = { path = "app" }
 
-[workspace.package]
-version = "0.1.0"
-edition = "2021"
-license = "GPL-3.0"
+[build-dependencies]
+extended-vnft-app = { path = "app" }
+sails-rs = { workspace = true, features = ["wasm-builder"] }
+sails-idl-gen.workspace = true
 
+[dev-dependencies]
+extended-vnft = { path = ".", features = ["wasm-binary"] }
+extended-vnft-client = { path = "client" }
+sails-rs = { workspace = true, features = ["gtest"] }
+tokio.workspace = true
+gclient.workspace = true
+gear-core.workspace = true
 
-[workspace.dependencies]
-gstd = "=1.8.1"
-sails-rs = "0.8.1"      
-sails-client-gen = "0.8.1"
-sails-idl-gen = "0.8.1"
+[features]
+wasm-binary = []

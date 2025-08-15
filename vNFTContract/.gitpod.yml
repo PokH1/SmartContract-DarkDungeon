@@ -1,4 +1,0 @@
-tasks:
-  - init: |
-      rustup target add wasm32v1-none
-      cargo build

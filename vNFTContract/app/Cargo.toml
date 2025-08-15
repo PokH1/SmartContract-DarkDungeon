@@ -1,12 +1,9 @@
 [package]
-name = "app"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+name = "extended-vnft-app"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-gstd.workspace = true
 sails-rs.workspace = true
-
-
-
+gstd.workspace = true
+vnft-service = { path = "../../vnft-service" }
